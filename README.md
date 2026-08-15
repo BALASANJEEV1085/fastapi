@@ -23,7 +23,7 @@ A containerized full-stack authentication system with a FastAPI backend and a Re
 1. **Clone the repository**
 ```bash
    git clone https://github.com/aylinasadi/fastapi_auth.git
-   cd your-repo-name
+   cd fastapi_auth
 ```
 
 2. **Set up environment variables**
