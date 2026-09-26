@@ -14,7 +14,6 @@ env:
   PUBLIC_URL: http://13.205.250.122
   SECRETS_MANAGER_ID: deptic/fastapi/secrets
   CONTAINER_PORT: "80"
-  DOCKER_CONTEXT: .
 
 jobs:
   build-and-push:
@@ -113,7 +112,7 @@ jobs:
       - name: Build and push full-stack image
         run: |
           set -euo pipefail
-          docker build -t "$FULL_IMAGE" -t "$ECR_REPOSITORY_URI:latest" "$DOCKER_CONTEXT"
+          docker build -t "$FULL_IMAGE" -t "$ECR_REPOSITORY_URI:latest" .
           docker push "$FULL_IMAGE"
           docker push "$ECR_REPOSITORY_URI:latest"
           echo "Pushed $FULL_IMAGE and :latest to ECR"
