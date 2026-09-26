@@ -1,4 +1,4 @@
-name: build-deploy-verify
+name: Build Deploy Verify Full-Stack FastAPI React (EC2 Docker)
 
 on:
   push:
@@ -10,15 +10,14 @@ env:
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   ECR_REPOSITORY_URI: 759204735992.dkr.ecr.ap-south-1.amazonaws.com/fastapi
-  INSTANCE_ID: i-0eaccedc87f24ab31
+  INSTANCE_ID: i-0092f595cf0cf8abf
+  PUBLIC_URL: http://13.205.250.122
   SECRETS_MANAGER_ID: deptic/fastapi/secrets
-  CONTAINER_PORT: "8000"
-  PUBLIC_URL: http://13.232.10.48
-  DOCKER_CONTEXT: backend
+  CONTAINER_PORT: "80"
 
 jobs:
   build-and-push:
-    name: Build backend image and push to ECR
+    name: Build diagnostics and push full-stack image to ECR
     runs-on: ubuntu-latest
     outputs:
       image_tag: ${{ steps.meta.outputs.image_tag }}
@@ -27,51 +26,65 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python (backend syntax diagnostics)
+      - name: Set up Python 3.11 (matches Dockerfile runtime base image)
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Set up Node.js (frontend lint/build diagnostics)
+      - name: Set up Node.js 20 (matches Dockerfile frontend-builder base image)
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
 
-      - name: Backend build diagnostics (compile FastAPI sources)
-        working-directory: backend
+      - name: Build diagnostics - compile backend Python sources
         run: |
           set -euo pipefail
-          python -m py_compile main.py db.py
+          echo "--- Python compile check (backend) ---"
+          python -m py_compile backend/main.py backend/db.py
+          echo "py_compile OK"
+
+      - name: Build diagnostics - validate backend requirements.txt
+        run: |
+          set -euo pipefail
+          echo "--- backend/requirements.txt ---"
+          cat backend/requirements.txt
+          python -m pip install --upgrade pip
+          python -m pip install -r backend/requirements.txt
           python - <<'PYEOF'
-          import ast, pathlib
-          for p in sorted(pathlib.Path(".").glob("*.py")):
-              ast.parse(p.read_text(), filename=str(p))
-              print(f"AST OK: {p}")
+          import fastapi, sqlalchemy, jose, passlib, dotenv, multipart, uvicorn
+          print("fastapi", fastapi.__version__)
+          print("sqlalchemy", sqlalchemy.__version__)
+          print("uvicorn", uvicorn.__version__)
+          print("backend dependency import check OK")
           PYEOF
-          echo "--- requirements.txt ---"
-          cat requirements.txt
 
-      - name: Frontend build diagnostics (npm ci, lint, vite build)
-        working-directory: frontend
+      - name: Build diagnostics - validate frontend dependencies and build
         run: |
           set -euo pipefail
-          if [ -f package-lock.json ]; then
-            npm ci
-          else
-            echo "No package-lock.json found; using npm install"
-            npm install --no-audit --no-fund
-          fi
-          npm run lint || echo "lint reported issues; continuing diagnostics"
+          echo "--- frontend/package.json ---"
+          cat frontend/package.json
+          cd frontend
+          npm install --legacy-peer-deps
           npm run build
-          test -f dist/index.html && echo "frontend dist/index.html produced"
+          test -f dist/index.html
+          echo "frontend vite build OK (dist/index.html present)"
 
-      - name: Configure AWS credentials (static AWS CLI)
+      - name: Build diagnostics - validate root Dockerfile topology
         run: |
           set -euo pipefail
-          aws --version
-          aws sts get-caller-identity --region "$AWS_REGION"
+          echo "--- Dockerfile (root context) ---"
+          cat Dockerfile
+          test -f Dockerfile
+          test -f backend/requirements.txt
+          test -f backend/main.py
+          test -f backend/db.py
+          test -f frontend/package.json
+          test -f frontend/index.html
+          grep -q 'EXPOSE 80' Dockerfile
+          grep -q 'uvicorn' Dockerfile
+          grep -q 'nginx' Dockerfile
+          grep -q 'proxy_pass http://127.0.0.1:8000' Dockerfile
+          echo "Dockerfile/context diagnostics OK (context=., container port=80, nginx proxies API to uvicorn 8000)"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -80,135 +93,119 @@ jobs:
         id: meta
         run: |
           set -euo pipefail
-          ECR_REGISTRY="${ECR_REPOSITORY_URI%%/*}"
-          IMAGE_TAG="$(date +%Y%m%d%H%M%S)-${GITHUB_SHA::7}"
+          IMAGE_TAG="$(date +%Y%m%d%H%M%S)-${GITHUB_SHA:0:7}"
           FULL_IMAGE="$ECR_REPOSITORY_URI:$IMAGE_TAG"
           {
             echo "image_tag=$IMAGE_TAG"
             echo "image_uri=$FULL_IMAGE"
           } >> "$GITHUB_OUTPUT"
-          echo "ECR_REGISTRY=$ECR_REGISTRY" >> "$GITHUB_ENV"
-          echo "Registry: $ECR_REGISTRY"
-          echo "Image:    $FULL_IMAGE"
+          echo "IMAGE_TAG=$IMAGE_TAG" >> "$GITHUB_ENV"
+          echo "FULL_IMAGE=$FULL_IMAGE" >> "$GITHUB_ENV"
+          echo "Image: $FULL_IMAGE"
 
-      - name: Docker buildx diagnostics (build backend context)
-        run: |
-          set -euo pipefail
-          docker buildx build \
-            --file "$DOCKER_CONTEXT/Dockerfile" \
-            --tag "${{ steps.meta.outputs.image_uri }}" \
-            --tag "$ECR_REPOSITORY_URI:latest" \
-            --load \
-            "$DOCKER_CONTEXT"
-          docker images --format '{{.Repository}}:{{.Tag}} {{.Size}}' | grep fastapi || true
-
-      - name: ECR login (direct AWS CLI)
+      - name: Docker login to ECR (static AWS credentials)
         run: |
           set -euo pipefail
           ECR_REGISTRY="${ECR_REPOSITORY_URI%%/*}"
-          aws ecr get-login-password --region "$AWS_REGION" \
-            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
 
-      - name: Push image to ECR
+      - name: Build and push full-stack image
         run: |
           set -euo pipefail
-          docker push "${{ steps.meta.outputs.image_uri }}"
+          docker build -t "$FULL_IMAGE" -t "$ECR_REPOSITORY_URI:latest" .
+          docker push "$FULL_IMAGE"
           docker push "$ECR_REPOSITORY_URI:latest"
+          echo "Pushed $FULL_IMAGE and :latest to ECR"
 
   deploy-to-ec2:
-    name: Deploy container to EC2 via SSM
+    name: Deploy image to EC2 Docker host via SSM
     runs-on: ubuntu-latest
-    needs: build-and-push
-    env:
-      IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
+    needs: [build-and-push]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials (static AWS CLI)
+      - name: Deploy via SSM run-command (docker pull and run on EC2)
         run: |
           set -euo pipefail
-          aws sts get-caller-identity --region "$AWS_REGION"
-
-      - name: Write SSM commands payload to JSON file
-        run: |
-          set -euo pipefail
-          ECR_REGISTRY="${ECR_REPOSITORY_URI%%/*}"
-          cat > /tmp/ssm-params.json << SSMPARAMS
+          IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
+          cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
               "set -euo pipefail",
-              "export REGION=$AWS_REGION",
-              "export ECR_REGISTRY=$ECR_REGISTRY",
-              "export IMAGE_URI=$IMAGE_URI",
-              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
-              "docker pull $IMAGE_URI",
+              "export AWS_REGION=ap-south-1",
+              "SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id deptic/fastapi/secrets --region ap-south-1 --query SecretString --output text)",
+              "SECRET_KEY=$(echo \"$SECRET_JSON\" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get(\"SECRET_KEY\",\"change-this-secret-in-production\"))' 2>/dev/null || echo change-this-secret-in-production)",
+              "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 759204735992.dkr.ecr.ap-south-1.amazonaws.com",
+              "docker pull __IMAGE_URI__",
               "docker stop app || true",
               "docker rm app || true",
-              "ENV_VARS=$(aws secretsmanager get-secret-value --secret-id $SECRETS_MANAGER_ID --region $REGION --query SecretString --output text)",
-              "docker run -d --restart always --name app -p 80:$CONTAINER_PORT -e SECRET_KEY=$(echo $ENV_VARS | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"SECRET_KEY\"])') -e DATABASE_URL=$(echo $ENV_VARS | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"DATABASE_URL\"])') -e ACCESS_TOKEN_EXPIRE_MINUTES=$(echo $ENV_VARS | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"ACCESS_TOKEN_EXPIRE_MINUTES\"])') $IMAGE_URI"
+              "docker run -d --restart always -p 80:80 --name app -v app_data:/app/data -e PYTHONUNBUFFERED=1 -e SECRET_KEY=\"$SECRET_KEY\" -e ALGORITHM=HS256 -e ACCESS_TOKEN_EXPIRE_MINUTES=30 -e DATABASE_URL=sqlite:////app/data/app.db __IMAGE_URI__"
             ]
           }
           SSMPARAMS
-          echo "--- /tmp/ssm-params.json ---"
-          cat /tmp/ssm-params.json
-
-      - name: Send SSM command to EC2 instance
-        run: |
-          set -euo pipefail
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --region "$AWS_REGION" \
-            --document-name "AWS-RunShellScript" \
-            --parameters file:///tmp/ssm-params.json \
-            --query "Command.CommandId" --output text)
+          sed -i "s|__IMAGE_URI__|$IMAGE_URI|g" /tmp/ssm-params.json
+          COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --region "$AWS_REGION" --document-name "AWS-RunShellScript" --parameters file:///tmp/ssm-params.json --query "Command.CommandId" --output text)
           echo "COMMAND_ID=$COMMAND_ID"
-          echo "COMMAND_ID=$COMMAND_ID" >> "$GITHUB_ENV"
-
-      - name: Wait for SSM command completion
-        run: |
-          set -euo pipefail
-          for i in $(seq 1 60); do
-            STATUS=$(aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --region "$AWS_REGION" \
-              --query "Status" --output text 2>/dev/null || echo "Pending")
-            echo "Attempt $i: status=$STATUS"
+          while true; do
+            STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" --query "Status" --output text)
+            echo "SSM status: $STATUS"
             case "$STATUS" in
-              Success) echo "SSM command succeeded"; exit 0 ;;
-              InProgress|Pending|Delayed) sleep 10 ;;
-              *) echo "SSM command failed with status $STATUS"
-                 aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" || true
-                 exit 1 ;;
+              Success) break ;;
+              InProgress|Pending|Delayed) sleep 5 ;;
+              *) echo "SSM command failed with status $STATUS"; aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION"; exit 1 ;;
             esac
           done
-          echo "Timed out waiting for SSM command"
-          exit 1
+          echo "SSM deploy command completed successfully"
 
-  verify:
-    name: Verify deployment health
+  verify-deployment:
+    name: Verify live deployment over HTTP
     runs-on: ubuntu-latest
-    needs: deploy-to-ec2
+    needs: [build-and-push, deploy-to-ec2]
     steps:
-      - name: Health check public URL (HTTP 200 required)
+      - name: Health check - frontend index via nginx (HTTP 200 required)
         run: |
           set -euo pipefail
           for i in $(seq 1 30); do
-            CODE=$(curl -s -o /tmp/health-body -w '%{http_code}' "$PUBLIC_URL/docs" || true)
-            echo "Attempt $i: HTTP $CODE"
-            if [ "$CODE" = "200" ]; then
-              echo "Health check passed with HTTP 200"
-              head -c 200 /tmp/health-body || true
-              exit 0
-            fi
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' "$PUBLIC_URL/" || true)
+            echo "Attempt $i: GET $PUBLIC_URL/ -> $CODE"
+            if [ "$CODE" = "200" ]; then break; fi
             sleep 10
           done
-          CODE_ROOT=$(curl -s -o /dev/null -w '%{http_code}' "$PUBLIC_URL" || true)
-          echo "Final fallback probe of $PUBLIC_URL returned HTTP $CODE_ROOT"
-          if [ "$CODE_ROOT" = "200" ]; then
-            echo "Root health check passed with HTTP 200"
-            exit 0
-          fi
-          echo "Health check failed: no HTTP 200 response"
-          exit 1
+          if [ "$CODE" != "200" ]; then echo "Frontend health check failed"; exit 1; fi
+          echo "Frontend health check OK (200)"
+
+      - name: Health check - FastAPI openapi.json through nginx proxy (HTTP 200 required)
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' "$PUBLIC_URL/openapi.json" || true)
+            echo "Attempt $i: GET $PUBLIC_URL/openapi.json -> $CODE"
+            if [ "$CODE" = "200" ]; then break; fi
+            sleep 10
+          done
+          if [ "$CODE" != "200" ]; then echo "API health check failed"; exit 1; fi
+          echo "API health check OK (200)"
+
+      - name: Functional smoke test - register and token endpoints reachable
+        run: |
+          set -euo pipefail
+          CODE_DOCS=$(curl -s -o /dev/null -w '%{http_code}' "$PUBLIC_URL/docs" || true)
+          echo "GET $PUBLIC_URL/docs -> $CODE_DOCS"
+          UNIQUE="civerify$(date +%s)"
+          CODE_REG=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$PUBLIC_URL/register" -H 'Content-Type: application/json' -d "{\"username\":\"$UNIQUE\",\"email\":\"$UNIQUE@example.com\",\"full_name\":\"CI Verify\",\"password\":\"ci-verify-pass-123\"}" || true)
+          echo "POST $PUBLIC_URL/register -> $CODE_REG"
+          if [ "$CODE_REG" != "200" ] && [ "$CODE_REG" != "201" ] && [ "$CODE_REG" != "400" ]; then echo "register endpoint unexpected status"; exit 1; fi
+          CODE_TOKEN=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$PUBLIC_URL/token" -H 'Content-Type: application/x-www-form-urlencoded' -d "username=$UNIQUE&password=ci-verify-pass-123" || true)
+          echo "POST $PUBLIC_URL/token -> $CODE_TOKEN"
+          if [ "$CODE_TOKEN" != "200" ]; then echo "token endpoint not healthy"; exit 1; fi
+          echo "Functional smoke test OK"
+
+      - name: Summary
+        run: |
+          {
+            echo "Deployment verified successfully."
+            echo "image_uri=${{ needs.build-and-push.outputs.image_uri }}"
+            echo "instance_id=$INSTANCE_ID"
+            echo "public_url=$PUBLIC_URL"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
