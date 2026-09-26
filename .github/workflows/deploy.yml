@@ -1,0 +1,199 @@
+name: Build & Deploy to EC2 Docker
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REGISTRY: 759204735992.dkr.ecr.ap-south-1.amazonaws.com
+  ECR_REPOSITORY: fastapi
+  INSTANCE_ID: i-074bc8abf6e2c64eb
+  PUBLIC_URL: http://13.205.89.68
+  TARGET_PORT: 80
+  DOCKERFILE_PATH: .
+  SECRET_ID: deptic/fastapi/secrets
+
+jobs:
+  build-and-verify:
+    name: Build & Smoke Test Stack
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package.json
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Backend diagnostics - install requirements
+        working-directory: backend
+        run: |
+          set -e
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python - <<'PYEOF'
+          import fastapi, uvicorn, sqlalchemy, jose, passlib, dotenv, multipart
+          print("backend imports OK:", fastapi.__version__, sqlalchemy.__version__)
+          PYEOF
+
+      - name: Backend diagnostics - compile check
+        run: |
+          set -e
+          python -m py_compile backend/main.py backend/db.py
+          echo "py_compile OK"
+
+      - name: Frontend diagnostics - npm install
+        working-directory: frontend
+        run: |
+          set -e
+          if [ -f package-lock.json ]; then npm ci --legacy-peer-deps; else npm install --legacy-peer-deps; fi
+
+      - name: Frontend diagnostics - lint
+        working-directory: frontend
+        run: npm run lint || echo "lint reported issues (non-fatal diagnostics)"
+
+      - name: Frontend diagnostics - vite build
+        working-directory: frontend
+        run: |
+          set -e
+          npm run build
+          test -f dist/index.html && echo "dist/index.html present"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker build diagnostics (unified image, no push)
+        run: |
+          set -e
+          docker build --file Dockerfile --tag fastapi-auth:ci .
+          docker images fastapi-auth:ci
+          echo "unified Dockerfile build OK"
+
+      - name: Container smoke test (nginx + uvicorn on port 80)
+        run: |
+          set -e
+          docker run -d --name smoke -p 80:80 \
+            -e SECRET_KEY=cinsecuresmoketestkey \
+            -e ALGORITHM=HS256 \
+            -e ACCESS_TOKEN_EXPIRE_MINUTES=30 \
+            -e DATABASE_URL=sqlite:////app/data/app.db \
+            fastapi-auth:ci
+          CODE=000
+          for i in $(seq 1 30); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:80/ || true)
+            if [ "$CODE" = "200" ]; then echo "container smoke test OK (HTTP 200)"; break; fi
+            sleep 2
+          done
+          if [ "$CODE" != "200" ]; then docker logs smoke; exit 1; fi
+          DOCS_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:80/docs || true)
+          echo "backend proxy /docs via nginx returned: $DOCS_CODE"
+          docker stop smoke || true
+          docker rm smoke || true
+
+  deploy:
+    name: Build, Push and Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build-and-verify
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build production image and tag for ECR
+        run: |
+          set -e
+          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          docker build --file "$DOCKERFILE_PATH/Dockerfile" --tag "$FULL_IMAGE:latest" --tag "$FULL_IMAGE:$GITHUB_SHA" "$DOCKERFILE_PATH"
+          echo "built images:"
+          docker images "$FULL_IMAGE"
+
+      - name: ECR login and push (direct AWS CLI, static credentials)
+        run: |
+          set -e
+          FULL_IMAGE="$ECR_REGISTRY/$ECR_REPOSITORY"
+          aws ecr get-login-password --region "$AWS_REGION" | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+          docker push "$FULL_IMAGE:latest"
+          docker push "$FULL_IMAGE:$GITHUB_SHA"
+          echo "pushed $FULL_IMAGE:latest and $FULL_IMAGE:$GITHUB_SHA"
+
+      - name: Write SSM commands payload to JSON file
+        run: |
+          cat > /tmp/ssm-params.json << 'SSMPARAMS'
+          {
+            "commands": [
+              "set -e",
+              "REGION=ap-south-1",
+              "ECR_REGISTRY=759204735992.dkr.ecr.ap-south-1.amazonaws.com",
+              "IMAGE_URI=759204735992.dkr.ecr.ap-south-1.amazonaws.com/fastapi:latest",
+              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
+              "docker pull $IMAGE_URI",
+              "docker stop app || true",
+              "docker rm app || true",
+              "SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id deptic/fastapi/secrets --region $REGION --query SecretString --output text)",
+              "SECRET_KEY=$(echo \"$SECRET_JSON\" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get(\"SECRET_KEY\",\"\"))' 2>/dev/null || echo '')",
+              "if [ -z \"$SECRET_KEY\" ]; then SECRET_KEY=$(openssl rand -hex 32); fi",
+              "docker run -d --restart always -p 80:80 --name app -e SECRET_KEY=$SECRET_KEY -e ALGORITHM=HS256 -e ACCESS_TOKEN_EXPIRE_MINUTES=30 -e DATABASE_URL=sqlite:////app/data/app.db $IMAGE_URI",
+              "for i in $(seq 1 30); do CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:80/ || true); if [ \"$CODE\" = \"200\" ]; then echo 'local health check OK'; break; fi; sleep 2; done",
+              "if [ \"$CODE\" != \"200\" ]; then docker logs app; exit 1; fi"
+            ]
+          }
+          SSMPARAMS
+
+      - name: Deploy to EC2 via SSM send-command
+        run: |
+          set -e
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --region "$AWS_REGION" \
+            --document-name "AWS-RunShellScript" \
+            --parameters file:///tmp/ssm-params.json \
+            --query "Command.CommandId" --output text)
+          echo "COMMAND_ID=$COMMAND_ID"
+          for i in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --region "$AWS_REGION" \
+              --query "Status" --output text 2>/dev/null || echo "Pending")
+            echo "ssm status: $STATUS"
+            if [ "$STATUS" = "Success" ]; then echo "remote deploy succeeded"; break; fi
+            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+              aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" || true
+              exit 1
+            fi
+            sleep 5
+          done
+          if [ "$STATUS" != "Success" ]; then echo "SSM command did not succeed in time"; exit 1; fi
+
+      - name: Final health check (public URL must return HTTP 200)
+        run: |
+          set -e
+          CODE=000
+          for i in $(seq 1 45); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL/" || true)
+            echo "attempt $i: public_url=$PUBLIC_URL/ http_code=$CODE"
+            if [ "$CODE" = "200" ]; then break; fi
+            sleep 4
+          done
+          if [ "$CODE" != "200" ]; then
+            echo "health check failed: expected 200, got $CODE"
+            exit 1
+          fi
+          echo "production health check OK: $PUBLIC_URL/ returned HTTP 200"
+          DOCS_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$PUBLIC_URL/docs" || true)
+          echo "public /docs (backend via nginx) returned: $DOCS_CODE"
