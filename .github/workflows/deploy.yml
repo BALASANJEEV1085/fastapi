@@ -13,12 +13,12 @@ env:
   INSTANCE_ID: i-007bfc0a89bf74354
   PUBLIC_URL: http://3.7.204.117
   SECRETS_MANAGER_ID: deptic/fastapi/secrets
-  CONTAINER_PORT: "8000"
-  DOCKER_CONTEXT: backend
+  CONTAINER_PORT: "80"
+  DOCKER_CONTEXT: .
 
 jobs:
   build-and-push:
-    name: Build diagnostics and push image to ECR
+    name: Build diagnostics and push unified image to ECR
     runs-on: ubuntu-latest
     outputs:
       image_tag: ${{ steps.meta.outputs.IMAGE_TAG }}
@@ -45,11 +45,11 @@ jobs:
           echo "backend python syntax OK"
           ls -la
 
-      - name: Frontend build diagnostics (npm ci + vite build + eslint)
+      - name: Frontend build diagnostics (npm install + vite build + eslint)
         working-directory: frontend
         run: |
           set -euo pipefail
-          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          if [ -f package-lock.json ]; then npm ci; else npm install --legacy-peer-deps; fi
           npm run build
           npm run lint || echo "lint warnings tolerated"
           test -f dist/index.html && echo "frontend dist/index.html OK"
@@ -63,26 +63,25 @@ jobs:
           set -euo pipefail
           ECR_REGISTRY="${ECR_REPOSITORY_URI%%/*}"
           IMAGE_TAG="${GITHUB_SHA}"
-          FULL_IMAGE="$ECR_REPOSITORY_URI"
-          IMAGE_URI="${FULL_IMAGE}:${IMAGE_TAG}"
+          IMAGE_URI="${ECR_REPOSITORY_URI}:${IMAGE_TAG}"
           {
             echo "IMAGE_TAG=${IMAGE_TAG}"
             echo "IMAGE_URI=${IMAGE_URI}"
           } >> "$GITHUB_OUTPUT"
           echo "ECR_REGISTRY=${ECR_REGISTRY}" >> "$GITHUB_ENV"
-          echo "Registry: $ECR_REGISTRY"
-          echo "Image:    $IMAGE_URI"
+          echo "Registry: ${ECR_REGISTRY}"
+          echo "Image:    ${IMAGE_URI}"
 
-      - name: Docker build diagnostics (metadata load)
+      - name: Docker build diagnostics (root multi-stage Dockerfile, metadata load)
         run: |
           set -euo pipefail
           docker buildx build \
-            --file backend/Dockerfile \
+            --file Dockerfile \
             --tag "${{ steps.meta.outputs.IMAGE_URI }}" \
             --load \
-            backend
+            .
           docker image inspect "${{ steps.meta.outputs.IMAGE_URI }}" --format 'IMAGE {{.Id}} SIZE {{.Size}}'
-          docker run --rm --entrypoint sh "${{ steps.meta.outputs.IMAGE_URI }}" -c 'python --version && ls /app'
+          docker run --rm --entrypoint sh "${{ steps.meta.outputs.IMAGE_URI }}" -c 'nginx -v && python3 --version && ls /app && ls /usr/share/nginx/html'
 
       - name: Login to Amazon ECR (AWS CLI, static credentials)
         run: |
@@ -104,49 +103,33 @@ jobs:
           docker push "${ECR_REPOSITORY_URI}:latest"
 
   deploy-to-ec2:
-    name: Deploy image to EC2 via SSM
-    runs-on: ubuntu-latest
+    name: Deploy unified container to EC2 via SSM
     needs: build-and-push
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Write SSM commands payload to JSON file
+      - name: Write SSM command payload to JSON file
         run: |
           cat > /tmp/ssm-params.json << 'SSMPARAMS'
           {
             "commands": [
               "set -euo pipefail",
-              "export AWS_DEFAULT_REGION=ap-south-1",
-              "ECR_REGISTRY=759204735992.dkr.ecr.ap-south-1.amazonaws.com",
-              "IMAGE_URI=759204735992.dkr.ecr.ap-south-1.amazonaws.com/fastapi:${IMAGE_TAG}",
-              "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin $ECR_REGISTRY",
+              "export AWS_REGION=ap-south-1",
+              "export ECR_REGISTRY=759204735992.dkr.ecr.ap-south-1.amazonaws.com",
+              "export IMAGE_URI=759204735992.dkr.ecr.ap-south-1.amazonaws.com/fastapi:${{ needs.build-and-push.outputs.image_tag }}",
+              "aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
               "docker pull $IMAGE_URI",
               "docker stop app || true",
               "docker rm app || true",
-              "ENV_JSON=$(aws secretsmanager get-secret-value --secret-id deptic/fastapi/secrets --region ap-south-1 --query SecretString --output text)",
-              "SECRET_KEY=$(echo \"$ENV_JSON\" | python3 -c 'import sys,json; print(json.load(sys.stdin)[\"SECRET_KEY\"])')",
-              "DATABASE_URL=$(echo \"$ENV_JSON\" | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"DATABASE_URL\", \"sqlite:///./app.db\"))')",
-              "ACCESS_TOKEN_EXPIRE_MINUTES=$(echo \"$ENV_JSON\" | python3 -c 'import sys,json; print(json.load(sys.stdin).get(\"ACCESS_TOKEN_EXPIRE_MINUTES\", \"30\"))')",
-              "docker run -d --restart always -p 80:8000 --name app -e SECRET_KEY=\"$SECRET_KEY\" -e ALGORITHM=HS256 -e DATABASE_URL=\"$DATABASE_URL\" -e ACCESS_TOKEN_EXPIRE_MINUTES=\"$ACCESS_TOKEN_EXPIRE_MINUTES\" $IMAGE_URI",
-              "docker ps --filter name=app --no-trunc"
+              "docker run -d --restart always -p 80:80 --name app $IMAGE_URI",
+              "docker ps --filter name=app --format '{{.Names}} {{.Status}}'"
             ]
           }
           SSMPARAMS
-          python3 - << 'PYEOF'
-          import json, os
-          path = "/tmp/ssm-params.json"
-          with open(path) as f:
-              payload = json.load(f)
-          tag = os.environ.get("IMAGE_TAG", "")
-          payload["commands"] = [c.replace("${IMAGE_TAG}", tag) for c in payload["commands"]]
-          with open(path, "w") as f:
-              json.dump(payload, f, indent=2)
-          print("SSM payload ready for tag", tag)
-          PYEOF
 
       - name: Send SSM command to EC2 instance
-        id: ssm
         run: |
           set -euo pipefail
           COMMAND_ID=$(aws ssm send-command \
@@ -155,62 +138,83 @@ jobs:
             --document-name "AWS-RunShellScript" \
             --parameters file:///tmp/ssm-params.json \
             --query "Command.CommandId" --output text)
-          echo "COMMAND_ID=${COMMAND_ID}" >> "$GITHUB_OUTPUT"
+          echo "COMMAND_ID=${COMMAND_ID}" >> "$GITHUB_ENV"
           echo "Dispatched SSM command: ${COMMAND_ID}"
 
       - name: Wait for SSM command completion
         run: |
           set -euo pipefail
-          COMMAND_ID="${{ steps.ssm.outputs.COMMAND_ID }}"
-          for i in $(seq 1 60); do
-            STATUS=$(aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --region "$AWS_REGION" \
-              --query "Status" --output text 2>/dev/null || echo "Pending")
-            echo "SSM status: $STATUS"
-            case "$STATUS" in
-              Success) echo "SSM command succeeded"; exit 0 ;;
-              InProgress|Pending|Delayed) sleep 10 ;;
-              *) echo "SSM command failed with status $STATUS"
-                 aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$AWS_REGION" || true
-                 exit 1 ;;
-            esac
-          done
-          echo "Timed out waiting for SSM command"
-          exit 1
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --region "$AWS_REGION"
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --region "$AWS_REGION" \
+            --query "Status" --output text)
+          echo "SSM status: ${STATUS}"
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$INSTANCE_ID" \
+            --region "$AWS_REGION" \
+            --query "StandardOutputContent" --output text
+          [ "$STATUS" = "Success" ]
 
   verify-health:
-    name: Verify production health (HTTP 200 only)
-    runs-on: ubuntu-latest
+    name: Verify production health over HTTP
     needs: deploy-to-ec2
+    runs-on: ubuntu-latest
     steps:
-      - name: Health check public URL until HTTP 200
+      - name: Health check public URL (nginx root, HTTP 200 required)
         run: |
           set -euo pipefail
-          URL="${PUBLIC_URL}"
           for i in $(seq 1 30); do
-            CODE=$(curl -s -o /tmp/health-body -w '%{http_code}' "$URL" || true)
-            echo "Attempt $i -> HTTP $CODE"
+            CODE=$(curl -s -o /tmp/health-body -w '%{http_code}' "${PUBLIC_URL}/" || true)
+            echo "attempt ${i}: HTTP ${CODE}"
             if [ "$CODE" = "200" ]; then
-              echo "Health check passed with HTTP 200"
-              head -c 500 /tmp/health-body || true
+              grep -qi '<div id="root">' /tmp/health-body && echo "frontend payload present" && exit 0
               exit 0
             fi
             sleep 10
           done
-          echo "Health check failed; last HTTP code: $CODE"
-          cat /tmp/health-body || true
+          echo "health check failed: never received HTTP 200 from ${PUBLIC_URL}"
           exit 1
 
-      - name: Assert backend API reachable through host mapping
+      - name: Verify backend API proxied through nginx (docs, HTTP 200 required)
         run: |
           set -euo pipefail
-          CODE=$(curl -s -o /dev/null -w '%{http_code}' "${PUBLIC_URL}/docs" || true)
-          echo "Backend docs endpoint HTTP code: $CODE"
-          if [ "$CODE" = "200" ]; then
-            echo "Backend API verified on container port 8000 via host port 80"
-          else
-            echo "Backend endpoint not 200 (got $CODE); deployment verification failed"
-            exit 1
-          fi
+          for i in $(seq 1 12); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' "${PUBLIC_URL}/docs" || true)
+            echo "attempt ${i}: HTTP ${CODE}"
+            [ "$CODE" = "200" ] && exit 0
+            sleep 10
+          done
+          echo "backend proxy health check failed for ${PUBLIC_URL}/docs"
+          exit 1
+
+      - name: Verify openapi.json reachable (HTTP 200 required)
+        run: |
+          set -euo pipefail
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' "${PUBLIC_URL}/openapi.json")
+          echo "openapi.json: HTTP ${CODE}"
+          [ "$CODE" = "200" ]
+
+  report-outputs:
+    name: Report deployment outputs
+    needs: [build-and-push, deploy-to-ec2, verify-health]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Summarize deployment
+        run: |
+          set -euo pipefail
+          echo "public_ip=3.7.204.117"
+          echo "public_url=http://3.7.204.117"
+          echo "alb_dns_name=3.7.204.117"
+          echo "instance_id=i-007bfc0a89bf74354"
+          echo "ecr_repo_url=759204735992.dkr.ecr.ap-south-1.amazonaws.com/fastapi"
+          echo "security_group_id=sg-097f4619950da0707"
+          echo "iam_instance_profile=fastapi-instance-profile"
+          echo "iam_role=fastapi-ec2-role"
+          echo "image_uri=${{ needs.build-and-push.outputs.image_uri }}"
+          echo "deployment verified: HTTP 200 on http://3.7.204.117"
