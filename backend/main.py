@@ -13,9 +13,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 load_dotenv()
 
-SECRET_KEY = os.getenv("SECRET_KEY")
-ALGORITHM = os.getenv("ALGORITHM")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES"))
+SECRET_KEY = os.getenv("SECRET_KEY", "change-this-secret-in-production")
+ALGORITHM = os.getenv("ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
 
 
 def get_db():
@@ -143,9 +143,10 @@ async def get_current_active_user(current_user: UserInDB = Depends(get_current_u
 
 @app.post("/register", response_model=User)
 def register_user(user: UserCreate, db: Session = Depends(get_db)):
-    existing_user = get_user(db, user.username)
-    if existing_user:
+    if get_user(db, user.username):
         raise HTTPException(status_code=400, detail="Username already registered")
+    if db.query(DBUser).filter(DBUser.email == user.email).first():
+        raise HTTPException(status_code=400, detail="Email already registered")
 
     hashed_password = get_password_hash(user.password)
     new_user = DBUser(
@@ -157,7 +158,11 @@ def register_user(user: UserCreate, db: Session = Depends(get_db)):
     )
 
     db.add(new_user)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Unable to create user")
     db.refresh(new_user)
 
     return new_user

@@ -1,5 +1,7 @@
 import { useState } from "react";
 
+const API_BASE_URL = import.meta.env.VITE_API_URL || "";
+
 function App() {
   const [isLoginView, setIsLoginView] = useState(true);
 
@@ -20,7 +22,7 @@ function App() {
     setSuccessMsg("");
 
     try {
-      const response = await fetch("http://127.0.0.1:8000/register", {
+      const response = await fetch(`${API_BASE_URL}/register`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -52,7 +54,7 @@ function App() {
     setSuccessMsg("");
 
     try {
-      const response = await fetch("http://127.0.0.1:8000/token", {
+      const response = await fetch(`${API_BASE_URL}/token`, {
         method: "POST",
         headers: {
           "Content-Type": "application/x-www-form-urlencoded",
@@ -79,7 +81,7 @@ function App() {
 
   const fetchProfile = async () => {
     try {
-      const response = await fetch("http://127.0.0.1:8000/users/me", {
+      const response = await fetch(`${API_BASE_URL}/users/me`, {
         method: "GET",
         headers: {
           "Authorization": `Bearer ${token}`, 
