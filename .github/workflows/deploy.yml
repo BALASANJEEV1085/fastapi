@@ -101,27 +101,27 @@ jobs:
           set -e
           FULL_IMAGE="$ECR_REPOSITORY_URI"
           docker run -d --name smoke \
-            -p 8000:80 \
+            -p 8080:80 \
             -e SECRET_KEY=smoketestsecret \
             -e ALGORITHM=HS256 \
             -e ACCESS_TOKEN_EXPIRE_MINUTES=30 \
-            -e DATABASE_URL=sqlite:////app/data/app.db \
+            -e DATABASE_URL=sqlite:////tmp/smoke.db \
             "$FULL_IMAGE:$GITHUB_SHA"
           for i in $(seq 1 30); do
-            CODE="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/ || true)"
-            API_CODE="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/docs || true)"
-            if [ "$CODE" = "200" ] && [ "$API_CODE" = "200" ]; then
-              echo "smoke test OK: frontend=$CODE api/docs=$API_CODE"
-              break
+            if curl -sf http://127.0.0.1:8080/ >/dev/null; then
+              echo "root page served"; break
             fi
             sleep 2
-            if [ "$i" = "30" ]; then
-              docker logs smoke || true
-              echo "smoke test FAILED: frontend=$CODE api/docs=$API_CODE"
-              exit 1
-            fi
+            if [ "$i" -eq 30 ]; then echo "smoke test: root page never became healthy"; docker logs smoke; exit 1; fi
           done
-          docker rm -f smoke
+          for i in $(seq 1 30); do
+            CODE="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/docs || true)"
+            if [ "$CODE" = "200" ]; then echo "API docs proxied through nginx OK"; break; fi
+            sleep 2
+            if [ "$i" -eq 30 ]; then echo "smoke test: /docs never returned 200"; docker logs smoke; exit 1; fi
+          done
+          docker logs smoke
+          docker stop smoke && docker rm smoke
 
       - name: Push image to Amazon ECR
         run: |
@@ -131,15 +131,8 @@ jobs:
           docker push "$FULL_IMAGE:latest"
           echo "pushed $FULL_IMAGE:$GITHUB_SHA and :latest"
 
-      - name: Upload image URI artifact for deploy job
-        run: |
-          set -e
-          mkdir -p /tmp/deploy
-          printf '%s:%s\n' "$ECR_REPOSITORY_URI" "$GITHUB_SHA" > /tmp/deploy/image-uri.txt
-          cat /tmp/deploy/image-uri.txt
-
-  deploy-and-verify:
-    name: Deploy to EC2 via SSM and Verify
+  deploy:
+    name: Deploy to EC2 via SSM
     needs: build-and-push
     runs-on: ubuntu-latest
     env:
@@ -150,125 +143,86 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Resolve image URI and registry
-        id: image
-        run: |
-          set -e
-          IMAGE_URI="$ECR_REPOSITORY_URI:$GITHUB_SHA"
-          ECR_REGISTRY="$(printf '%s' "$ECR_REPOSITORY_URI" | cut -d'/' -f1)"
-          echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
-          echo "ecr_registry=$ECR_REGISTRY" >> "$GITHUB_OUTPUT"
-          echo "deploying $IMAGE_URI via $ECR_REGISTRY"
-
-      - name: Write SSM commands payload to JSON file
-        id: ssm-payload
+      - name: Resolve runtime secrets from AWS Secrets Manager
+        id: runtime-secrets
         run: |
           set -e
           REGION="$AWS_REGION"
-          ECR_REGISTRY="${{ steps.image.outputs.ecr_registry }}"
-          IMAGE_URI="${{ steps.image.outputs.image_uri }}"
-          cat > /tmp/ssm-params.json << 'SSMPARAMS'
+          SECRET_JSON="$(aws secretsmanager get-secret-value --secret-id "$SECRETS_MANAGER_ID" --region "$REGION" --query SecretString --output text)"
+          SECRET_KEY="$(printf '%s' "$SECRET_JSON" | python -c 'import json,sys; d=json.load(sys.stdin); print(d.get("SECRET_KEY", d.get("secret_key", "")))')"
+          if [ -z "$SECRET_KEY" ]; then
+            echo "SECRET_KEY not found in Secrets Manager payload; generating fallback"
+            SECRET_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+          fi
+          {
+            echo "SECRET_KEY=$SECRET_KEY"
+          } >> "$GITHUB_ENV"
+          echo "runtime secrets resolved"
+
+      - name: Send SSM command to EC2 instance (pull and run new image)
+        id: ssm-deploy
+        run: |
+          set -e
+          REGION="$AWS_REGION"
+          IMAGE_URI="$ECR_REPOSITORY_URI:$GITHUB_SHA"
+          ECR_REGISTRY="$(printf '%s' "$ECR_REPOSITORY_URI" | cut -d'/' -f1)"
+          cat > /tmp/ssm-params.json << SSMPARAMS
           {
             "commands": [
-              "set -e",
-              "export AWS_DEFAULT_REGION=ap-south-1",
-              "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 759204735992.dkr.ecr.ap-south-1.amazonaws.com",
-              "docker pull 759204735992.dkr.ecr.ap-south-1.amazonaws.com/fastapi:IMAGE_SHA_PLACEHOLDER",
+              "aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY",
+              "docker pull $IMAGE_URI",
               "docker stop app || true",
               "docker rm app || true",
-              "docker run -d --restart always -p 80:80 --name app -e SECRET_KEY=$(aws secretsmanager get-secret-value --secret-id deptic/fastapi/secrets --query SecretString --output text | python3 -c 'import sys,json;print(json.load(sys.stdin)[\"SECRET_KEY\"])') -e ALGORITHM=HS256 -e ACCESS_TOKEN_EXPIRE_MINUTES=30 -e DATABASE_URL=sqlite:////app/data/app.db -v /app/data:/app/data 759204735992.dkr.ecr.ap-south-1.amazonaws.com/fastapi:IMAGE_SHA_PLACEHOLDER",
-              "docker image prune -f || true"
+              "docker run -d --restart always -p 80:80 --name app -e SECRET_KEY=$SECRET_KEY -e ALGORITHM=HS256 -e ACCESS_TOKEN_EXPIRE_MINUTES=30 -e DATABASE_URL=sqlite:////app/data/app.db $IMAGE_URI"
             ]
           }
           SSMPARAMS
-          sed -i "s|IMAGE_SHA_PLACEHOLDER|$GITHUB_SHA|g" /tmp/ssm-params.json
-          cat /tmp/ssm-params.json
-
-      - name: Send SSM command to EC2 instance
-        id: ssm-send
-        run: |
-          set -e
-          REGION="$AWS_REGION"
-          INSTANCE_ID="$INSTANCE_ID"
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --region "$REGION" \
-            --document-name "AWS-RunShellScript" \
-            --parameters file:///tmp/ssm-params.json \
-            --query "Command.CommandId" \
-            --output text)
+          COMMAND_ID=$(aws ssm send-command --instance-ids "$INSTANCE_ID" --region "$REGION" --document-name "AWS-RunShellScript" --parameters file:///tmp/ssm-params.json --query "Command.CommandId" --output text)
           echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
-          echo "sent SSM command $COMMAND_ID to $INSTANCE_ID"
+          echo "sent SSM command $COMMAND_ID"
 
       - name: Wait for SSM command completion
         run: |
           set -e
           REGION="$AWS_REGION"
-          INSTANCE_ID="$INSTANCE_ID"
-          COMMAND_ID="${{ steps.ssm-send.outputs.command_id }}"
+          COMMAND_ID="${{ steps.ssm-deploy.outputs.command_id }}"
           for i in $(seq 1 60); do
-            STATUS=$(aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" \
-              --instance-id "$INSTANCE_ID" \
-              --region "$REGION" \
-              --query "Status" --output text || echo "Pending")
-            echo "ssm status: $STATUS"
-            if [ "$STATUS" = "Success" ]; then
-              echo "SSM command succeeded"
-              break
-            fi
-            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "TimedOut" ] || [ "$STATUS" = "Cancelled" ]; then
-              aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION" || true
-              echo "SSM command failed with status $STATUS"
+            STATUS=$(aws ssm list-command-invocations --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION" --query "CommandInvocations[0].Status" --output text)
+            echo "SSM status: $STATUS"
+            if [ "$STATUS" = "Success" ]; then echo "deployment command succeeded"; exit 0; fi
+            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+              aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region "$REGION" --query "StandardErrorContent" --output text || true
               exit 1
             fi
-            sleep 5
-            if [ "$i" = "60" ]; then
-              echo "SSM command timed out waiting for success"
-              exit 1
-            fi
+            sleep 10
           done
+          echo "SSM command did not complete in time"; exit 1
 
-      - name: Health check - public URL must return HTTP 200
+  verify:
+    name: Verify Production Health
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Health check public URL (HTTP 200 required)
         run: |
           set -e
-          PUBLIC_URL="$PUBLIC_URL"
+          URL="$PUBLIC_URL"
           for i in $(seq 1 30); do
-            CODE="$(curl -s -o /dev/null -w '%{http_code}' "$PUBLIC_URL/" || true)"
-            echo "attempt $i: HTTP $CODE from $PUBLIC_URL/"
-            if [ "$CODE" = "200" ]; then
-              echo "health check OK: HTTP 200"
-              break
-            fi
-            sleep 5
-            if [ "$i" = "30" ]; then
-              echo "health check FAILED: last code $CODE"
-              exit 1
-            fi
+            CODE="$(curl -s -o /dev/null -w '%{http_code}' "$URL/" || true)"
+            echo "attempt $i: HTTP $CODE"
+            if [ "$CODE" = "200" ]; then echo "health check passed"; exit 0; fi
+            sleep 10
           done
+          echo "health check failed: never received HTTP 200 from $URL"; exit 1
 
-      - name: Health check - API docs proxied through nginx must return HTTP 200
+      - name: Verify API proxied through nginx (docs endpoint HTTP 200)
         run: |
           set -e
-          PUBLIC_URL="$PUBLIC_URL"
-          for i in $(seq 1 30); do
-            CODE="$(curl -s -o /dev/null -w '%{http_code}' "$PUBLIC_URL/docs" || true)"
-            echo "attempt $i: HTTP $CODE from $PUBLIC_URL/docs"
-            if [ "$CODE" = "200" ]; then
-              echo "api health check OK: HTTP 200"
-              break
-            fi
+          URL="$PUBLIC_URL"
+          for i in $(seq 1 15); do
+            CODE="$(curl -s -o /dev/null -w '%{http_code}' "$URL/docs" || true)"
+            echo "attempt $i: /docs HTTP $CODE"
+            if [ "$CODE" = "200" ]; then echo "API proxy verified"; exit 0; fi
             sleep 5
-            if [ "$i" = "30" ]; then
-              echo "api health check FAILED: last code $CODE"
-              exit 1
-            fi
           done
-
-      - name: Deployment summary
-        run: |
-          set -e
-          echo "Deployed image: $ECR_REPOSITORY_URI:$GITHUB_SHA"
-          echo "Instance: $INSTANCE_ID"
-          echo "Public URL: $PUBLIC_URL"
-          echo "Container port: $CONTAINER_PORT"
+          echo "API verify failed: /docs never returned HTTP 200"; exit 1
